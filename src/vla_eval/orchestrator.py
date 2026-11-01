@@ -338,7 +338,7 @@ class Orchestrator:
             """Drive slot ``i`` through ``run_item``, then release it from the batch."""
             task_idx, task, ep = batch[i][1]
             try:
-                outcomes[i] = await run_item(indices[i], task_idx, task, ep, views[i], conns[i])
+                outcomes[i] = await run_item(indices[i], task_idx, task, ep, views[i], conns[i], slot=i)
             except RecordingError as exc:
                 fatal.append(exc)
             finally:
@@ -496,8 +496,13 @@ class Orchestrator:
                 task_idx, first_task, ep = work_items[0]
                 self._validate_filename_stem(rec_cfg, first_task, safe_name, task_idx, ep)
 
-        async def run_item(item_idx: int, task_idx: int, task: Task, ep: int, bench: Any, ep_conn: Connection) -> str:
-            """Run one episode on ``bench``; return "ok", "error", "retry" or "abort" (stop the benchmark)."""
+        async def run_item(
+            item_idx: int, task_idx: int, task: Task, ep: int, bench: Any, ep_conn: Connection, slot: int = 0
+        ) -> str:
+            """Run one episode on ``bench``; return "ok", "error", "retry" or "abort" (stop the benchmark).
+
+            ``slot`` is the episode's position in its batch (0 outside batching).
+            """
             task_name = task.get("name", str(task))
             watchdog.pet(f"{safe_name} {task_name} ep{ep}")
             recorder: EpisodeRecorder = NullEpisodeRecorder()
@@ -550,7 +555,9 @@ class Orchestrator:
                 if self.num_shards is not None and self.shard_id is not None:
                     # Lets benchmarks split per-shard resources (e.g. RoboDojo's spare layouts).
                     task["shard_id"], task["num_shards"] = self.shard_id, self.num_shards
-                recorder = self._build_recorder(rec_cfg, task, bench_eval_id, safe_name, task_idx, ep, benchmark)
+                recorder = self._build_recorder(
+                    rec_cfg, task, bench_eval_id, safe_name, task_idx, ep, benchmark, slot=slot
+                )
                 raw = await runner.run_episode(bench, task, ep_conn, max_steps=max_steps, recorder=recorder)
                 raw["episode_id"] = ep
                 ep_result = cast(EpisodeResult, raw)
@@ -674,6 +681,7 @@ class Orchestrator:
         task_idx: int,
         episode_id: int,
         benchmark: Any,
+        slot: int = 0,
     ) -> EpisodeRecorder:
         """Build per-episode recorder from YAML config + task dict, or Null if recording is off.
 
@@ -685,9 +693,12 @@ class Orchestrator:
             return NullEpisodeRecorder()
         eid = str(uuid.uuid4())
         allowed = getattr(benchmark, "_ALL_RECORD_FIELDS", None)
+        # The model server keys per-session state (action chunk buffers) on ``recording.sid``,
+        # so episodes that run side by side in one batch must not share it.
+        sid = self._sid if slot == 0 else f"{self._sid}-{slot}"
         return EpisodeRecorder(
             store=self._store,
-            sid=self._sid,
+            sid=sid,
             eid=eid,
             eval_id=bench_eval_id,
             output_dir=rec_cfg.get("output_dir") or str(self._output_dir / "episodes"),

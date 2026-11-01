@@ -935,3 +935,29 @@ async def test_batched_benchmark_runs_each_episode_once(echo_server, tmp_path, d
     keys = sorted((t["task"], ep["episode_id"]) for t in result["tasks"] for ep in t["episodes"])
     assert keys == [(f"task_{t}", e) for t in range(2) for e in range(3)]
     assert result["num_errors"] == 0 and "partial" not in result
+
+
+@pytest.mark.anyio
+async def test_batched_slots_record_under_distinct_sids(echo_server, tmp_path):
+    """Episodes of one batch get distinct recording sids.
+
+    The model server keys per-session state (action chunk buffers) on ``recording.sid``;
+    a shared sid would let one slot pop actions predicted for another.
+    """
+    BatchedStub.batches, BatchedStub.retried = [], set()
+    config = _config(echo_server, tmp_path, "s", episodes=3)
+    with patch("vla_eval.orchestrator.resolve_import_string", return_value=BatchedStub):
+        orch = Orchestrator(config, eval_id="ev-s")
+        await orch.run()
+    conn = sqlite3.connect(str(tmp_path / "recording-ev-s.sqlite"))
+    rows = conn.execute("SELECT sid, task_name, episode_id FROM episode_results").fetchall()
+    conn.close()
+    sids = {(task, ep): sid for sid, task, ep in rows}
+    assert len(sids) == 6
+    assert sids[("task_0", 0)] == orch._sid  # slot 0 keeps the shard's sid, as in the unbatched path
+    # Each recorded episode belongs to the last batch that reset it (a retried attempt leaves no row).
+    last = {key: i for i, group in enumerate(BatchedStub.batches) for key in group}
+    for i in range(len(BatchedStub.batches)):
+        side_by_side = [sids[key] for key, j in last.items() if j == i]
+        assert len(set(side_by_side)) == len(side_by_side)
+    assert max(sum(j == i for j in last.values()) for i in range(len(BatchedStub.batches))) == 2
