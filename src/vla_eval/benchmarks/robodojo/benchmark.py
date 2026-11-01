@@ -32,6 +32,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -69,9 +70,11 @@ class _NoopModelClient:
     """
 
     def __init__(self, **_: Any) -> None:
+        """Accept and ignore the policy client options."""
         pass
 
     def call(self, **_: Any) -> None:
+        """Answer a policy call with nothing."""
         return None
 
 
@@ -135,6 +138,10 @@ class RoboDojoBenchmark(StepBenchmark):
             )
         self._num_envs = num_envs
         self._env: Any = None
+        # Whether the env's scene has been reset since it was (re)built; see _fresh_scene.
+        self._scene_used = False
+        # OS thread that built the env; close() only works there (see _close_here).
+        self._env_thread: int | None = None
         self._app: Any = None
         self._current_task_name = ""
         self._native_eval_num = 0
@@ -152,6 +159,7 @@ class RoboDojoBenchmark(StepBenchmark):
     # -----------------------------------------------------------------
 
     def _launch_app(self) -> None:
+        """Start the Isaac SimulationApp once and put RoboDojo on ``sys.path``."""
         if self._app is not None:
             return
         if not self._root.is_dir():
@@ -257,7 +265,7 @@ class RoboDojoBenchmark(StepBenchmark):
         info = env.robot_action_dim_info
         actual_dims = tuple(dim for pair in zip(info["arm_dim"], info["ee_dim"]) for dim in pair)
         if actual_dims != ACTION_DIMS:
-            self._bounded_close(env)
+            self._close_here(env)
             raise RuntimeError(f"RoboDojo embodiment reports action dims {actual_dims}, expected {ACTION_DIMS}")
         logger.info(
             "RoboDojo env built: task=%s step_lim=%s native_eval_num=%s layout_group=%s",
@@ -292,6 +300,7 @@ class RoboDojoBenchmark(StepBenchmark):
     # -----------------------------------------------------------------
 
     def get_tasks(self) -> list[Task]:
+        """One task per requested task name; raises if a task module is missing."""
         missing = [
             name
             for name in self._task_names
@@ -330,17 +339,38 @@ class RoboDojoBenchmark(StepBenchmark):
     def _ensure_env(self, task_name: str) -> Any:
         """The EvalEnv of ``task_name``, built on first use; one task per process."""
         if self._env is not None and task_name != self._current_task_name:
-            # Measured: env.close() on a clean stack_blocks scene never returns (>180s), so
-            # clear_instance() is never reached and a second env raises "context already exists".
+            # Closing the old env leaves the sim context behind (clear_instance() is never
+            # reached), so a second env raises "context already exists".
             raise RuntimeError(
                 "RoboDojo runs one task per process; split multi-task configs into "
                 "one `vla-eval run` per task (see scripts/run_robodojo_protocol.sh)"
             )
         if self._env is None:
+            self._env_thread = threading.get_ident()
             self._env = self._build_env(task_name)
             self._current_task_name = task_name
             self._spare_cursor = 0
+            self._scene_used = False
         return self._env
+
+    def _fresh_scene(self, env: Any) -> None:
+        """Close the previous scene before the next reset, as upstream main.py does between batches.
+
+        A reset on a used scene re-runs init_cameras, which stacks another tiled render product
+        per camera and never frees the old ones (CameraView._clean_up_tiled_sensor checks a field
+        that is never set). Measured at num_envs=10: +4.5 GiB, slower render and brighter frames
+        per reset. After close() the next reset relaunches the sim (base_env.reset), so the env
+        object stays usable; close took 0.8s and memory stayed flat. Only the env's own thread
+        may close it (see _close_here); elsewhere this falls back to the leaking soft reset.
+        """
+        if not self._scene_used:
+            self._scene_used = True
+            return
+        started = time.monotonic()
+        if self._close_here(env):
+            logger.info("RoboDojo closed the used scene in %.1fs", time.monotonic() - started)
+        else:
+            logger.warning("RoboDojo reset on another thread than the env's; resetting the used scene")
 
     def _counted_episode(self, env: Any, task: Task) -> tuple[int, int]:
         """Return ``(total layouts, episode_idx)``; reject ids outside the counted layouts."""
@@ -366,6 +396,7 @@ class RoboDojoBenchmark(StepBenchmark):
 
     def _try_layout(self, env: Any, layout_id: int, task_name: str) -> Any:
         """Reset onto ``layout_id``; return the first observation, or None if the scene failed."""
+        self._fresh_scene(env)
         try:
             env.reset(seed=[layout_id])
             env.run_reward()
@@ -375,8 +406,7 @@ class RoboDojoBenchmark(StepBenchmark):
                 env.get_score()
             return env.get_obs()
         except Exception:
-            # Never close() here: teardown destroys the cameras and any later
-            # reset dies in init_cameras. Just move on to a spare layout.
+            # The next attempt closes this scene before resetting (_fresh_scene).
             logger.warning(
                 "RoboDojo layout %d failed for %s; falling back to a spare layout",
                 layout_id,
@@ -387,6 +417,7 @@ class RoboDojoBenchmark(StepBenchmark):
 
     @staticmethod
     def _unflatten_action(values: Any) -> dict[str, np.ndarray]:
+        """Split the flat 14-dim action into RoboDojo's per-part joint dict."""
         flat = np.asarray(values, dtype=np.float32).reshape(-1)
         if flat.size != ACTION_DIM:
             raise ValueError(f"RoboDojo expects {ACTION_DIM} action values, got {flat.size}")
@@ -399,6 +430,7 @@ class RoboDojoBenchmark(StepBenchmark):
         }
 
     def step(self, action: Action) -> StepResult:
+        """Apply one action to env 0 and report whether its episode ended."""
         assert self._env is not None
         env = self._env
         env.take_action(self._unflatten_action(action.get("actions", action.get("action"))))
@@ -437,6 +469,7 @@ class RoboDojoBenchmark(StepBenchmark):
 
     @staticmethod
     def _to_rgb(image: Any) -> np.ndarray:
+        """Convert a camera image to contiguous uint8 RGB."""
         array = np.asarray(image)
         if array.dtype != np.uint8:
             if array.size and float(np.nanmax(array)) <= 1.0:
@@ -445,6 +478,7 @@ class RoboDojoBenchmark(StepBenchmark):
         return np.ascontiguousarray(array[..., :3])
 
     def _extract_frame(self, raw_obs: Any) -> np.ndarray | None:
+        """First color frame among the cameras, or ``None`` when there is none."""
         vision = (raw_obs.get("vision") or {}) if isinstance(raw_obs, dict) else {}
         for camera in vision.values():
             if isinstance(camera, dict) and "color" in camera:
@@ -452,6 +486,7 @@ class RoboDojoBenchmark(StepBenchmark):
         return None
 
     def make_obs(self, raw_obs: Any, task: Task) -> Observation:
+        """Build the vla-eval observation from RoboDojo's raw observation."""
         vision = raw_obs.get("vision") or {}
         camera_names = self._camera_names or list(vision)
         images: dict[str, np.ndarray] = {}
@@ -483,6 +518,7 @@ class RoboDojoBenchmark(StepBenchmark):
         return np.concatenate([np.asarray(state[k], dtype=np.float32).reshape(-1) for k in keys])
 
     def get_step_result(self, step_result: StepResult) -> EpisodeResult:
+        """Episode result from the last step: success, partial score and layout."""
         return {
             "success": bool(step_result.info.get("success", False)),
             "score": float(step_result.info.get("score", 0.0)),
@@ -490,9 +526,11 @@ class RoboDojoBenchmark(StepBenchmark):
         }
 
     def get_metric_keys(self) -> dict[str, str]:
+        """Both metrics are averaged over episodes."""
         return {"success": "mean", "score": "mean"}
 
     def get_metadata(self) -> dict[str, Any]:
+        """Static benchmark metadata reported with the results."""
         return {
             "max_steps": DEFAULT_MAX_STEPS,
             "suite": "robodojo",
@@ -501,6 +539,7 @@ class RoboDojoBenchmark(StepBenchmark):
         }
 
     def get_action_spec(self) -> dict[str, DimSpec]:
+        """The 14-dim dual-arm joint action."""
         return {
             "actions": DimSpec(
                 "actions",
@@ -511,37 +550,39 @@ class RoboDojoBenchmark(StepBenchmark):
         }
 
     def get_observation_spec(self) -> dict[str, DimSpec]:
+        """Images and language, plus joint state when ``send_state`` is on."""
         spec = {"images": IMAGE_RGB, "language": LANGUAGE}
         if self._send_state:
             spec["state"] = STATE_JOINT
         return spec
 
-    @staticmethod
-    def _bounded_close(env: Any) -> None:
-        import threading
+    def _close_here(self, env: Any) -> bool:
+        """Close ``env`` if this is the thread that built it; return whether it was closed.
 
-        def _close() -> None:
-            try:
-                env.close()
-            except Exception:
-                logger.exception("RoboDojo env close failed")
-
-        # EvalEnv.close() has been measured to hang past 180s even on a clean scene;
-        # bound it so callers make progress and the harness can still write results.
-        closer = threading.Thread(target=_close, name="robodojo-env-close", daemon=True)
-        closer.start()
-        closer.join(timeout=60)
-        if closer.is_alive():
-            logger.warning("RoboDojo env close still hanging after 60s; abandoning it")
+        Measured: close() on the env's own thread takes 0.8s; on any other thread it never
+        returns (deadlocks in SyntheticData._reset_node_graph), and after an earlier close it
+        holds the GIL, so not even a join(timeout) comes back. Never close elsewhere.
+        """
+        if threading.get_ident() != self._env_thread:
+            return False
+        try:
+            env.close()
+        except Exception:
+            logger.exception("RoboDojo env close failed")
+        return True
 
     def _close_env(self) -> None:
+        """Drop the env and close it when on its own thread."""
         if self._env is None:
             return
         env = self._env
         self._env = None
-        self._bounded_close(env)
+        if not self._close_here(env):
+            # cleanup() runs on the orchestrator's thread; process exit reclaims the GPU.
+            logger.info("RoboDojo env left open for process exit (built on another thread)")
 
     def cleanup(self) -> None:
+        """Release the env; the SimulationApp is left for process exit."""
         self._close_env()
         # Like behavior1k, never call SimulationApp.close() — Kit teardown can hang;
         # the benchmark container's process exit reclaims the GPU.
@@ -558,6 +599,7 @@ class RoboDojoBenchmark(StepBenchmark):
         return batch.open_batch(self, size)
 
     def render(self) -> np.ndarray | None:
+        """Current frame of the first camera, or ``None`` before the env exists."""
         if self._env is None:
             return None
         return self._extract_frame(self._env.get_obs())
@@ -566,6 +608,7 @@ class RoboDojoBenchmark(StepBenchmark):
     # own asyncio loop cannot tear down the orchestrator's.
 
     async def start_episode(self, task: Task, recorder: EpisodeRecorder | None = None) -> None:
+        """Reset the env for ``task`` on the worker thread."""
         self._t0 = time.monotonic()
         self._task = task
         self._recorder = recorder or NullEpisodeRecorder()
@@ -573,4 +616,5 @@ class RoboDojoBenchmark(StepBenchmark):
         self._last_result = StepResult(obs=raw_obs, reward=0.0, done=False, info={})
 
     async def apply_action(self, action: Action) -> None:
+        """Step the env with ``action`` on the worker thread."""
         self._last_result = await _run_in_thread(self.step, action)

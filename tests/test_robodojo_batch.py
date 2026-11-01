@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from types import SimpleNamespace
 from typing import Any
 
@@ -35,13 +36,20 @@ class _FakeBatchEnv:
         self._steps = [0] * num_envs
         self.reset_calls: list[list[int | None]] = []
         self.step_calls: list[list[int]] = []
+        self.closes: list[int] = []
+        self.reset_threads: list[int] = []
         self.raise_on_reset = False
         self.raise_on_step = False
+
+    def close(self) -> None:
+        """Tear the scene down; records how many resets it followed."""
+        self.closes.append(len(self.reset_calls))
 
     def reset(self, seed: list[int | None]) -> None:
         """Reset the envs with a seed; ``None`` leaves an env as it is."""
         assert len(seed) == self._n
         self.reset_calls.append(list(seed))
+        self.reset_threads.append(threading.get_ident())
         if self.raise_on_reset:
             raise RuntimeError("PhysX blew up")
         self.unstable_envs = [i for i, s in enumerate(seed) if s in self._broken]
@@ -181,6 +189,20 @@ async def test_unstable_slot_retries_on_a_spare_layout() -> None:
     again = await _run_batch(bench, [1])
     assert env.reset_calls[-1] == [6, None]
     assert again == [{"success": True, "score": 1.0, "layout_id": 6}]
+
+
+@pytest.mark.anyio
+async def test_later_batches_close_the_used_scene_first() -> None:
+    """Like upstream main.py, every batch after the first closes the scene before its reset."""
+    bench, env = _bench(num_envs=2)
+    await _run_batch(bench, [0, 1])
+    assert env.closes == []
+    bench._env_thread = env.reset_threads[0]  # as if _ensure_env built it on the worker thread
+    await _run_batch(bench, [2, 3])
+    await _run_batch(bench, [4])
+    assert env.closes == [1, 2]
+    assert env.reset_calls == [[0, 1], [2, 3], [4, None]]
+    assert len(set(env.reset_threads)) == 1
 
 
 @pytest.mark.anyio
