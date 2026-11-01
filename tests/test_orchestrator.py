@@ -13,6 +13,8 @@ import numpy as np
 import pytest
 import websockets.exceptions
 
+from vla_eval.model_servers.base import SessionContext
+from vla_eval.model_servers.predict import PredictModelServer
 from vla_eval.orchestrator import Orchestrator, _merge_observation_params, _shard_work_items
 
 from tests.conftest import BrokenTracker, RecordingTracker, StubBenchmark
@@ -961,3 +963,74 @@ async def test_batched_slots_record_under_distinct_sids(echo_server, tmp_path):
         side_by_side = [sids[key] for key, j in last.items() if j == i]
         assert len(set(side_by_side)) == len(side_by_side)
     assert max(sum(j == i for j in last.values()) for i in range(len(BatchedStub.batches))) == 2
+
+
+class _TagChunkServer(PredictModelServer):
+    """Chunked server whose every action carries the tag of the observation it was predicted from."""
+
+    def __init__(self) -> None:
+        """Four actions per inference, served from the per-session chunk buffer."""
+        super().__init__(chunk_size=4, action_ensemble="newest")
+
+    def predict(self, obs, ctx: SessionContext) -> dict:
+        """Fill the chunk with ``obs['value']``."""
+        return {"actions": np.full((4, 7), obs["value"], dtype=np.float32)}
+
+
+class _TaggedView(StubBenchmark):
+    """One batch slot: tags its observations with its own episode and logs every action it executes."""
+
+    executed: list[tuple[float, float]] = []
+
+    def __init__(self) -> None:
+        """Episodes span two chunks, so a shared buffer is popped across slots."""
+        super().__init__(done_at_step=6)
+        self._tag = 0.0
+
+    def reset(self, task):
+        """Tag this episode by task and episode index."""
+        self._tag = 100.0 * int(task["name"].split("_")[1]) + int(task["episode_idx"]) + 1
+        return super().reset(task)
+
+    def make_obs(self, raw_obs, task) -> dict:
+        """Send the tag as ``value``."""
+        return {"value": self._tag, "task_description": task["name"]}
+
+    def step(self, action):
+        """Log (own tag, tag the action was predicted for)."""
+        _TaggedView.executed.append((self._tag, float(np.asarray(action["actions"]).ravel()[0])))
+        return super().step(action)
+
+
+class _TaggedBatch(StubBenchmark):
+    """Two :class:`_TaggedView` slots per batch."""
+
+    def batch_size(self) -> int:
+        """Two episodes per batch."""
+        return 2
+
+    def open_batch(self, size: int) -> list:
+        """One tagged view per slot."""
+        return [_TaggedView() for _ in range(size)]
+
+
+@pytest.mark.anyio
+async def test_batched_slots_only_execute_their_own_chunks(free_port, tmp_path):
+    """With recording on, a chunked server must never hand one slot actions predicted for another.
+
+    The server keys its chunk buffer on ``recording.sid``; slots that shared the shard's sid popped
+    from one queue, and each ``episode_start`` reset it under the other slot.
+    """
+    from tests.conftest import start_server, stop_server
+
+    _TaggedView.executed = []
+    server = await start_server(_TagChunkServer(), free_port)
+    try:
+        config = _config(f"ws://127.0.0.1:{free_port}", tmp_path, "c", episodes=4)
+        with patch("vla_eval.orchestrator.resolve_import_string", return_value=_TaggedBatch):
+            (result,) = await Orchestrator(config, eval_id="ev-c", no_save=False).run()
+    finally:
+        await stop_server(server)
+    assert result["num_errors"] == 0
+    assert len(_TaggedView.executed) == 2 * 4 * 6
+    assert [pair for pair in _TaggedView.executed if pair[0] != pair[1]] == []
