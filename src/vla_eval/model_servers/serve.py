@@ -68,6 +68,9 @@ _CONFIG_WHITELIST: dict[str, type] = {
 # Backpressure monitoring — shared across all connections
 # ---------------------------------------------------------------------------
 _inflight: int = 0
+# recording.sid -> open connections that claimed it. Per-session state (chunk buffers, RNG) keys
+# on that sid, so two live connections sharing one would read and reset each other's state.
+_sid_claims: dict[str, set[str]] = {}
 _BACKPRESSURE_CHECK_INTERVAL: float = 5.0  # seconds between checks
 _BACKPRESSURE_COOLDOWN: float = 30.0  # minimum seconds between warnings
 
@@ -133,6 +136,8 @@ async def _handle_connection(
                 # code can open a StepRecorder against the same SQLite the harness uses.
                 rec = msg.payload.get("recording") or {}
                 effective_sid = rec.get("sid") or session_id
+                if rec.get("sid"):
+                    _claim_sid(effective_sid, session_id)
                 episode_id = rec.get("eid") or str(uuid.uuid4())
                 ctx = SessionContext(
                     session_id=effective_sid,
@@ -215,6 +220,28 @@ async def _handle_connection(
                 await model_server.on_episode_end({}, ctx)
             except Exception:
                 logger.exception("Error in cleanup on_episode_end session=%s", session_id[:8])
+        _release_sids(session_id)
+
+
+def _claim_sid(sid: str, conn_id: str) -> None:
+    """Record that connection ``conn_id`` runs under ``sid``; warn if another open connection does too."""
+    owners = _sid_claims.setdefault(sid, set())
+    if conn_id not in owners and owners:
+        logger.warning(
+            "recording sid %s is already in use by %d other open connection(s); per-session state "
+            "(action chunk buffers, RNG) is shared between them. Each concurrent episode needs its own sid.",
+            sid[:8],
+            len(owners),
+        )
+    owners.add(conn_id)
+
+
+def _release_sids(conn_id: str) -> None:
+    """Drop every sid claim held by a closed connection."""
+    for sid in [s for s, owners in _sid_claims.items() if conn_id in owners]:
+        _sid_claims[sid].discard(conn_id)
+        if not _sid_claims[sid]:
+            del _sid_claims[sid]
 
 
 def _make_process_request(model_server: ModelServer) -> Any:

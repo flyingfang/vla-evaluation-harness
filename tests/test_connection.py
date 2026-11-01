@@ -142,3 +142,30 @@ async def test_listening_raises_when_connection_drops(free_port):
                 await anyio.sleep(30)
     finally:
         await conn.close()
+
+
+@pytest.mark.anyio
+async def test_server_warns_when_open_connections_share_a_recording_sid(echo_server, caplog):
+    """Per-session server state keys on recording.sid, so two live connections must not share one."""
+
+    async def start(conn: Connection, sid: str) -> None:
+        await conn.start_episode({"task": "t", "recording": {"sid": sid, "eid": "e"}})
+        await conn.act({"value": 1.0})  # round trip: the server has handled episode_start
+
+    caplog.set_level("WARNING", logger="vla_eval.model_servers.serve")
+    async with Connection(echo_server) as a, Connection(echo_server) as b:
+        await start(a, "sid-a")
+        await start(b, "sid-b")
+        await start(a, "sid-a")  # the same connection reusing its sid is fine
+        assert "already in use" not in caplog.text
+        await start(b, "sid-a")
+        assert "already in use by 1 other open connection" in caplog.text
+    caplog.clear()
+    from vla_eval.model_servers import serve
+
+    with anyio.fail_after(5):  # the server releases a connection's claims once it sees the close
+        while "sid-a" in serve._sid_claims:
+            await anyio.sleep(0.01)
+    async with Connection(echo_server) as c:
+        await start(c, "sid-a")
+    assert "already in use" not in caplog.text
