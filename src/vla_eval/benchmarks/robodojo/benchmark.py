@@ -368,34 +368,17 @@ class RoboDojoBenchmark(VectorStepBenchmark):
         return [{"name": name, "suite": "robodojo"} for name in self._task_names]
 
     def _check_curobo_config(self) -> None:
-        """Fail at run start if the planner's ``curobo.yml`` was not generated for this root.
-
-        Without the check, a missing or stale config fails every round's env build, or the first
-        ``ee`` step raises ``KeyError`` in ``solve_ik`` because no IK solver was built.
-
-        Raises:
-            FileNotFoundError: The config, its URDF or its asset root does not exist.
-            ValueError: The config still holds the ``${ASSETS_PATH}`` placeholder.
-        """
+        """Fail at run start, not after Isaac Sim boots, if ``curobo.yml`` is missing or made for another root."""
         import yaml
 
         path = self._root / CUROBO_CONFIG
-        hint = "generate it from curobo_tmp.yml (see 'End-effector actions' in configs/benchmarks/robodojo/README.md)"
-        if not path.is_file():
+        config = yaml.safe_load(path.read_text()) if path.is_file() else None
+        urdf = (((config or {}).get("robot_cfg") or {}).get("kinematics") or {}).get("urdf_path")
+        if not urdf or not Path(urdf).is_file():  # also catches a leftover ${ASSETS_PATH}
             raise FileNotFoundError(
-                f"RoboDojo planner config {path} not found (planner on, action_type={self._action_type!r}); {hint}"
+                f"RoboDojo planner config {path} is missing or its urdf_path {urdf!r} does not exist; generate it "
+                "from curobo_tmp.yml (see 'End-effector actions' in configs/benchmarks/robodojo/README.md)"
             )
-        text = path.read_text()
-        if "ASSETS_PATH" in text:
-            raise ValueError(f"RoboDojo planner config {path} still holds the ASSETS_PATH placeholder; {hint}")
-        kinematics = ((yaml.safe_load(text) or {}).get("robot_cfg") or {}).get("kinematics") or {}
-        for key, exists in (("urdf_path", Path.is_file), ("asset_root_path", Path.is_dir)):
-            value = kinematics.get(key)
-            if not value or not exists(Path(value)):
-                raise FileNotFoundError(
-                    f"RoboDojo planner config {path}: robot_cfg.kinematics.{key}={value!r} does not exist "
-                    f"(generated for another root?); {hint}"
-                )
 
     def resume(self, results: list[dict[str, Any]]) -> None:
         for r in results:
